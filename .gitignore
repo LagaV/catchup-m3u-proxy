@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+*.zip
+node_modules/
+npm-debug.log*

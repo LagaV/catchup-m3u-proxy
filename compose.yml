@@ -1,0 +1,22 @@
+services:
+  catchup-m3u-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: catchup-m3u-proxy
+    restart: unless-stopped
+    # Avoids allocating a Docker bridge subnet. Requires a Linux Docker host.
+    # HOST keeps the service local to the host for Tailscale Serve.
+    network_mode: host
+    environment:
+      PORT: "8787"
+      HOST: "127.0.0.1"
+      # The fixed playlist served at http://<docker-host>:8787/playlist.m3u.
+      # Quote the complete upstream URL because it may contain '&'.
+      PLAYLIST_URL: "${PLAYLIST_URL:-}"
+      # Public base URL clients use to reach this container. Set this to the
+      # Docker host's LAN or Tailscale URL; never use localhost for remote apps.
+      PUBLIC_ORIGIN: "${PUBLIC_ORIGIN:-}"
+      # Optional comma-separated upstream hostnames. Include every CDN reached
+      # after HLS redirects. Empty allows all HTTP(S) upstreams.
+      UPSTREAM_ALLOWLIST: "${UPSTREAM_ALLOWLIST:-}"
