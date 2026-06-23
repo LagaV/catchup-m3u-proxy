@@ -11,6 +11,12 @@ services:
     environment:
       PORT: "8787"
       HOST: "127.0.0.1"
+      # Set to true in .env to log proxied requests without query parameters.
+      PROXY_LOG: "${PROXY_LOG:-false}"
+      # Number of days searched at every proxy start to discover ZDF retention.
+      ZDF_CATCHUP_PROBE_DAYS: "${ZDF_CATCHUP_PROBE_DAYS:-3}"
+      # Requires the Kodi inputstream.ffmpegdirect add-on on Kodi clients.
+      KODI_FFMPEGDIRECT: "${KODI_FFMPEGDIRECT:-false}"
       # The fixed playlist served at http://<docker-host>:8787/playlist.m3u.
       # Quote the complete upstream URL because it may contain '&'.
       PLAYLIST_URL: "${PLAYLIST_URL:-}"

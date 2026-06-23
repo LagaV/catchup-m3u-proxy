@@ -93,20 +93,35 @@ export function rewriteUris(playlist, sourceUrl, proxyOrigin, catchup = null) {
     .replace(/^([^#\r\n][^\r\n]*)$/gm, (_match, uri) => proxy(uri));
 }
 
-export function addCatchupChannelTags(playlist, sourceUrl, proxyOrigin) {
+export function addCatchupChannelTags(playlist, sourceUrl, proxyOrigin, catchupDaysForChannel = () => 1) {
   const lines = playlist.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
   for (let index = 0; index < lines.length; index += 1) {
     if (!lines[index].startsWith('#EXTINF:') || /\bcatchup=/.test(lines[index])) continue;
     const uriIndex = lines.findIndex((line, candidate) => candidate > index && isUri(line));
     if (uriIndex === -1) continue;
     const stream = new URL(lines[uriIndex], sourceUrl).toString();
-    const source = `${proxyOrigin}/catchup?url=${encodeURIComponent(stream)}&start={utc}&duration={duration}`;
+    // Kodi's ffmpegdirect passes this string straight into its catch-up URL
+    // formatter. A path form avoids a nested URL and raw ampersands there.
+    const source = `${proxyOrigin}/catchup/${Buffer.from(stream).toString('base64url')}/{utc}/{duration}.m3u8`;
+    const catchupDays = Math.max(1, Math.ceil(Number(catchupDaysForChannel(lines[index], stream)) || 1));
     const separator = lines[index].indexOf(',');
     if (separator !== -1) {
-      lines[index] = `${lines[index].slice(0, separator)} catchup="default" catchup-days="1" catchup-source="${source}"${lines[index].slice(separator)}`;
+      lines[index] = `${lines[index].slice(0, separator)} catchup="default" catchup-days="${catchupDays}" catchup-source="${source}"${lines[index].slice(separator)}`;
     }
   }
   return lines.join('\n');
+}
+
+export function addKodiFfmpegDirect(playlist) {
+  const lines = playlist.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const result = [];
+  for (const line of lines) {
+    if (line.startsWith('#EXTINF:') && result.at(-1) !== '#KODIPROP:inputstream=inputstream.ffmpegdirect') {
+      result.push('#KODIPROP:inputstream=inputstream.ffmpegdirect');
+    }
+    result.push(line);
+  }
+  return result.join('\n');
 }
 
 export function selectCatchupRange(playlist, start, duration) {
@@ -140,6 +155,135 @@ export function selectCatchupRange(playlist, start, duration) {
   return header.join('\n');
 }
 
+function parseMediaSegments(playlist) {
+  const lines = playlist.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const mediaSequence = Number(lines.find((line) => line.startsWith('#EXT-X-MEDIA-SEQUENCE:'))?.slice('#EXT-X-MEDIA-SEQUENCE:'.length));
+  const segments = [];
+  let pendingDuration = null;
+  let pendingDurationIndex = null;
+  let pendingProgramTime = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) pendingProgramTime = parseProgramDateTime(line);
+    else if (line.startsWith('#EXTINF:')) {
+      pendingDuration = Number.parseFloat(line.slice('#EXTINF:'.length));
+      pendingDurationIndex = index;
+    } else if (isUri(line) && pendingDuration !== null) {
+      segments.push({ duration: pendingDuration, extinfIndex: pendingDurationIndex, uri: line, programTime: pendingProgramTime });
+      pendingDuration = null;
+      pendingDurationIndex = null;
+      pendingProgramTime = null;
+    }
+  }
+  return { lines, mediaSequence, segments };
+}
+
+function zdfSegmentTemplate(uri, sourceUrl, expectedSequence) {
+  const absolute = new URL(uri, sourceUrl).toString();
+  const match = absolute.match(/^(.*\/)(\d+)\.(ts|aac)$/);
+  if (!match || Number(match[2]) !== expectedSequence) return null;
+  return (sequence) => `${match[1]}${sequence}.${match[3]}`;
+}
+
+export function zdfCatchupPlaylist({ playlist, sourceUrl, start, duration, earliestSequence }) {
+  const parsed = parseMediaSegments(playlist);
+  const first = parsed.segments[0];
+  if (!first || !Number.isInteger(parsed.mediaSequence) || first.programTime === null || Math.abs(first.duration - 2) > 0.001) return undefined;
+  const segmentUrl = zdfSegmentTemplate(first.uri, sourceUrl, parsed.mediaSequence);
+  if (!segmentUrl) return undefined;
+
+  const requestedFirst = parsed.mediaSequence + Math.floor((start - first.programTime) / first.duration);
+  const requestedLast = Math.min(
+    parsed.mediaSequence + parsed.segments.length - 1,
+    parsed.mediaSequence + Math.ceil((start + duration - first.programTime) / first.duration) - 1,
+  );
+  const firstSequence = Math.max(requestedFirst, earliestSequence);
+  if (firstSequence > requestedLast) return null;
+
+  const headerEnd = parsed.lines.findIndex((line) => line.startsWith('#EXT-X-PROGRAM-DATE-TIME:') || line.startsWith('#EXTINF:'));
+  const header = parsed.lines.slice(0, headerEnd === -1 ? parsed.lines.length : headerEnd)
+    .filter((line) => !line.startsWith('#EXT-X-ENDLIST'))
+    .map((line) => line.startsWith('#EXT-X-MEDIA-SEQUENCE:') ? `#EXT-X-MEDIA-SEQUENCE:${firstSequence}` : line);
+  for (let sequence = firstSequence; sequence <= requestedLast; sequence += 1) {
+    const programTime = first.programTime + (sequence - parsed.mediaSequence) * first.duration;
+    header.push(`#EXT-X-PROGRAM-DATE-TIME:${isoDate(programTime)}`, `#EXTINF:${first.duration},`, segmentUrl(sequence));
+  }
+  header.push('#EXT-X-ENDLIST');
+  return header.join('\n');
+}
+
+async function findZdfArchiveBoundary({ playlist, sourceUrl, start, fetchImpl, cache }) {
+  const parsed = parseMediaSegments(playlist);
+  const first = parsed.segments[0];
+  if (!first || !Number.isInteger(parsed.mediaSequence) || first.programTime === null || Math.abs(first.duration - 2) > 0.001) return undefined;
+  const segmentUrl = zdfSegmentTemplate(first.uri, sourceUrl, parsed.mediaSequence);
+  if (!segmentUrl) return undefined;
+  const cacheKey = segmentUrl(parsed.mediaSequence).replace(/\d+\.ts$/, '{sequence}.ts');
+  const cached = cache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.sequence;
+
+  const requestedFirst = parsed.mediaSequence + Math.floor((start - first.programTime) / first.duration);
+  if (requestedFirst >= parsed.mediaSequence) return parsed.mediaSequence;
+  const available = async (sequence) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4_000);
+    try {
+      // Akamai closes Node HEAD requests for some ZDF AAC renditions even when
+      // the segment exists. A one-byte range GET reliably validates existence
+      // without downloading the complete media chunk.
+      const response = await fetchImpl(segmentUrl(sequence), {
+        headers: { Range: 'bytes=0-0' },
+        signal: controller.signal,
+        redirect: 'follow',
+      });
+      await response.body?.cancel();
+      return response.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+  let low = requestedFirst;
+  let high = parsed.mediaSequence; // The current playlist proves this segment exists.
+  if (await available(low)) high = low;
+  else {
+    while (low + 1 < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (await available(middle)) high = middle;
+      else low = middle;
+    }
+  }
+  cache.set(cacheKey, { sequence: high, expiresAt: Date.now() + 5 * 60_000 });
+  return high;
+}
+
+function firstUriFollowing(lines, index) {
+  for (let candidate = index + 1; candidate < lines.length; candidate += 1) {
+    if (isUri(lines[candidate])) return lines[candidate];
+  }
+  return null;
+}
+
+async function resolveZdfMediaPlaylist({ playlistUrl, fetchImpl }) {
+  let target = new URL(playlistUrl);
+  for (let depth = 0; depth < 4; depth += 1) {
+    const response = await fetchImpl(target, { redirect: 'follow' });
+    if (!response.ok) return null;
+    const body = await response.text();
+    const finalUrl = response.url || target.toString();
+    const parsed = parseMediaSegments(body);
+    if (parsed.segments.length > 0) return { playlist: body, sourceUrl: finalUrl };
+    const zdfIndex = parsed.lines.findIndex((line) => /tvg-name="ZDF"/i.test(line));
+    const streamUri = zdfIndex === -1
+      ? parsed.lines.find((line, index) => line.startsWith('#EXT-X-STREAM-INF:') && firstUriFollowing(parsed.lines, index)) && firstUriFollowing(parsed.lines, parsed.lines.findIndex((line) => line.startsWith('#EXT-X-STREAM-INF:')))
+      : firstUriFollowing(parsed.lines, zdfIndex);
+    if (!streamUri) return null;
+    target = new URL(streamUri, finalUrl);
+  }
+  return null;
+}
+
 function allowedTarget(target, allowlist) {
   if (!['http:', 'https:'].includes(target.protocol)) return false;
   return allowlist.length === 0 || allowlist.includes(target.hostname);
@@ -155,14 +299,20 @@ export function createServer({
   allowlist = (process.env.UPSTREAM_ALLOWLIST ?? '').split(',').map((value) => value.trim()).filter(Boolean),
   playlistUrl = process.env.PLAYLIST_URL,
   publicOrigin = process.env.PUBLIC_ORIGIN,
+  zdfProbeDays = Number(process.env.ZDF_CATCHUP_PROBE_DAYS ?? 3),
+  kodiFfmpegDirect = /^(1|true|yes)$/i.test(process.env.KODI_FFMPEGDIRECT ?? ''),
+  logRequests = /^(1|true|yes)$/i.test(process.env.PROXY_LOG ?? ''),
+  logger = console,
 } = {}) {
+  const zdfArchiveBoundaries = new Map();
+  const catchupDays = { zdf: 1 };
   let configuredOrigin = null;
   if (publicOrigin) {
     const parsedOrigin = new URL(publicOrigin);
     if (!['http:', 'https:'].includes(parsedOrigin.protocol)) throw new Error('PUBLIC_ORIGIN must use http or https');
     configuredOrigin = parsedOrigin.origin;
   }
-  return http.createServer(async (request, response) => {
+  const server = http.createServer(async (request, response) => {
     const requestOrigin = `http://${request.headers.host ?? 'localhost'}`;
     const proxyOrigin = configuredOrigin ?? requestOrigin;
     const requestUrl = new URL(request.url ?? '/', requestOrigin);
@@ -171,7 +321,8 @@ export function createServer({
       response.end(JSON.stringify({ ok: true }));
       return;
     }
-    const isCatchupRequest = requestUrl.pathname === '/catchup';
+    const catchupPath = requestUrl.pathname.match(/^\/catchup\/([^/]+)\/([^/]+)\/([^/]+)\.m3u8$/);
+    const isCatchupRequest = requestUrl.pathname === '/catchup' || catchupPath !== null;
     const isFixedPlaylistRequest = requestUrl.pathname === '/playlist.m3u';
     if (requestUrl.pathname !== '/proxy' && !isCatchupRequest && !isFixedPlaylistRequest) {
       response.writeHead(404).end('Use GET /playlist.m3u or /proxy?url=https%3A%2F%2Fupstream%2Fplaylist.m3u8');
@@ -180,7 +331,8 @@ export function createServer({
 
     let target;
     try {
-      target = new URL(isFixedPlaylistRequest ? playlistUrl ?? '' : requestUrl.searchParams.get('url') ?? '');
+      const pathTarget = catchupPath ? Buffer.from(catchupPath[1], 'base64url').toString('utf8') : null;
+      target = new URL(isFixedPlaylistRequest ? playlistUrl ?? '' : pathTarget ?? requestUrl.searchParams.get('url') ?? '');
     } catch {
       response.writeHead(isFixedPlaylistRequest ? 503 : 400).end(isFixedPlaylistRequest ? 'PLAYLIST_URL is not configured' : 'A valid url query parameter is required');
       return;
@@ -189,8 +341,14 @@ export function createServer({
       response.writeHead(403).end('Upstream URL is not allowed');
       return;
     }
-    const start = Number(requestUrl.searchParams.get('start'));
-    const duration = Number(requestUrl.searchParams.get('duration'));
+    const startedAt = Date.now();
+    const log = (status, detail = '') => {
+      if (!logRequests) return;
+      // Do not log query parameters: playlist URLs frequently contain credentials.
+      logger.info(`[proxy] ${request.method ?? 'GET'} ${requestUrl.pathname} ${status} ${target.origin}${target.pathname} ${Date.now() - startedAt}ms${detail ? ` ${detail}` : ''}`);
+    };
+    const start = Number(catchupPath ? catchupPath[2] : requestUrl.searchParams.get('start'));
+    const duration = Number(catchupPath ? catchupPath[3] : requestUrl.searchParams.get('duration'));
     if (isCatchupRequest && (!Number.isFinite(start) || !Number.isFinite(duration) || duration <= 0)) {
       response.writeHead(400).end('Catch-up requests require numeric start and duration query parameters');
       return;
@@ -202,13 +360,28 @@ export function createServer({
       const upstream = await fetchImpl(target, { signal: controller.signal, redirect: 'follow' });
       const contentType = upstream.headers.get('content-type') ?? 'application/octet-stream';
       if (!upstream.ok) {
+        log(upstream.status, 'upstream-error');
         response.writeHead(upstream.status).end(`Upstream returned ${upstream.status}`);
         return;
       }
       if (isM3u8(target, contentType)) {
         const body = await upstream.text();
-        const ranged = isCatchupRequest ? selectCatchupRange(body, start, duration) : body;
+        const finalUrl = upstream.url || target.toString();
+        let ranged = isCatchupRequest ? selectCatchupRange(body, start, duration) : body;
+        if (isCatchupRequest) {
+          const earliestSequence = await findZdfArchiveBoundary({
+            playlist: body,
+            sourceUrl: finalUrl,
+            start,
+            fetchImpl,
+            cache: zdfArchiveBoundaries,
+          });
+          if (earliestSequence !== undefined) {
+            ranged = zdfCatchupPlaylist({ playlist: body, sourceUrl: finalUrl, start, duration, earliestSequence });
+          }
+        }
         if (isCatchupRequest && ranged === null) {
+          log(404, 'catchup-unavailable');
           response.writeHead(404).end('Requested catch-up window is not available');
           return;
         }
@@ -216,22 +389,55 @@ export function createServer({
         // fetch follows redirects. Relative HLS URIs must be based on the final
         // response location, otherwise a redirected master playlist points its
         // video/audio renditions back at the pre-redirect host.
-        const finalUrl = upstream.url || target.toString();
         const catchup = isCatchupRequest ? { start: String(start), duration: String(duration) } : null;
-        const channelTagged = !body.includes('#EXT-X-') && !isCatchupRequest ? addCatchupChannelTags(tagged, finalUrl, proxyOrigin) : tagged;
+        let channelTagged = !body.includes('#EXT-X-') && !isCatchupRequest
+          ? addCatchupChannelTags(tagged, finalUrl, proxyOrigin, (extinf) => /tvg-name="ZDF"/i.test(extinf) ? catchupDays.zdf : 1)
+          : tagged;
+        if (!body.includes('#EXT-X-') && !isCatchupRequest && kodiFfmpegDirect) channelTagged = addKodiFfmpegDirect(channelTagged);
         const rewritten = rewriteUris(channelTagged, finalUrl, proxyOrigin, catchup);
         response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl; charset=utf-8', 'cache-control': 'no-store' });
         response.end(rewritten);
+        log(200, isCatchupRequest ? 'catchup' : 'playlist');
       } else {
         response.writeHead(200, { 'content-type': contentType, 'cache-control': 'no-store' });
         response.end(Buffer.from(await upstream.arrayBuffer()));
+        log(200, 'media');
       }
     } catch (error) {
+      log(502, 'upstream-failure');
       response.writeHead(502).end(`Upstream request failed: ${error.message}`);
     } finally {
       clearTimeout(timeout);
     }
   });
+  server.refreshCatchupDays = async () => {
+    if (!playlistUrl) return catchupDays.zdf;
+    try {
+      const media = await resolveZdfMediaPlaylist({ playlistUrl, fetchImpl });
+      if (!media) return catchupDays.zdf;
+      const parsed = parseMediaSegments(media.playlist);
+      const first = parsed.segments[0];
+      const last = parsed.segments.at(-1);
+      if (!first || !last || first.programTime === null || last.programTime === null) return catchupDays.zdf;
+      const probeStart = first.programTime - Math.max(1, zdfProbeDays) * 24 * 60 * 60;
+      const boundary = await findZdfArchiveBoundary({
+        playlist: media.playlist,
+        sourceUrl: media.sourceUrl,
+        start: probeStart,
+        fetchImpl,
+        cache: zdfArchiveBoundaries,
+      });
+      if (boundary === undefined) return catchupDays.zdf;
+      const archiveStart = first.programTime + (boundary - parsed.mediaSequence) * first.duration;
+      catchupDays.zdf = Math.max(1, Math.ceil((last.programTime + last.duration - archiveStart) / (24 * 60 * 60)));
+      if (logRequests) logger.info(`[proxy] discovered ZDF catch-up window: ${catchupDays.zdf} day(s)`);
+      return catchupDays.zdf;
+    } catch (error) {
+      if (logRequests) logger.warn(`[proxy] ZDF catch-up discovery failed: ${error.message}`);
+      return catchupDays.zdf;
+    }
+  };
+  return server;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -246,5 +452,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     }
     process.exitCode = 1;
   });
-  server.listen(port, host, () => console.log(`Catch-up M3U proxy listening on ${host ?? 'all interfaces'}:${port}`));
+  server.listen(port, host, () => {
+    console.log(`Catch-up M3U proxy listening on ${host ?? 'all interfaces'}:${port}`);
+    server.refreshCatchupDays();
+  });
 }

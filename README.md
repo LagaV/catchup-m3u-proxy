@@ -8,8 +8,8 @@ returned.
 
 For top-level channel M3U playlists, the proxy adds the `catchup="default"`,
 `catchup-days`, and `catchup-source` attributes that TiviMate and Kodi IPTV Simple
-use to expose catch-up from the guide. `catchup-source` targets the proxy's local
-`/catchup` route, which selects the requested time range from the source HLS
+use to expose catch-up from the guide. `catchup-source` targets a URL-safe local
+`/catchup/<channel>/{utc}/{duration}.m3u8` route, which selects the requested time range from the source HLS
 playlist. The effective archive is limited to the source playlist's current
 sliding window (two hours for the tested ARD feed), not a full-day archive.
 
@@ -47,11 +47,31 @@ To expose a fixed client playlist, create a `.env` file beside `compose.yml`:
 ```dotenv
 PLAYLIST_URL=https://provider.example/playlist.m3u?username=YOUR_USER&password=YOUR_PASSWORD
 PUBLIC_ORIGIN=https://...:8787
+PROXY_LOG=true
+ZDF_CATCHUP_PROBE_DAYS=3
+KODI_FFMPEGDIRECT=true
 ```
 
 Then configure TiviMate or Kodi with `http://192.168.1.50:8787/playlist.m3u`.
 `PUBLIC_ORIGIN` is required when the client reaches the container through a
 different address than the request host, such as a reverse proxy or Docker host.
+Set `PROXY_LOG=true` to log each proxy request, its HTTP result, and elapsed
+time. Query strings are deliberately omitted so provider credentials in playlist
+URLs are not written to Docker logs.
+
+At each proxy start, ZDF starts with `catchup-days="1"` and is then measured in
+the background. `ZDF_CATCHUP_PROBE_DAYS` defines how far back that discovery
+searches; the resulting number of started days is used in subsequently served
+channel playlists. The server still probes the actual segment boundary: a
+programme that only partly overlaps the retained archive is returned only from
+its first available segment; an entirely expired programme is reported
+unavailable.
+
+Set `KODI_FFMPEGDIRECT=true` only for Kodi-focused deployments. It inserts
+`#KODIPROP:inputstream=inputstream.ffmpegdirect` before each channel entry, so
+Kodi IPTV Simple can select the ffmpegdirect inputstream for live timeshift and
+catch-up. The `inputstream.ffmpegdirect` Kodi add-on must be installed and
+enabled on the client.
 
 The proxy will be available on port `8787` of the Docker host. Use the Docker
 host's LAN or Tailscale address (not `localhost`) in TiviMate or Kodi when the

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { addCatchupChannelTags, addCatchupTags, rewriteUris, selectCatchupRange } from '../src/server.js';
+import { addCatchupChannelTags, addCatchupTags, addKodiFfmpegDirect, rewriteUris, selectCatchupRange, zdfCatchupPlaylist } from '../src/server.js';
 
 const playlist = `#EXTM3U
 #EXT-X-TARGETDURATION:60
@@ -37,7 +37,17 @@ test('proxies relative media URIs', () => {
 test('adds TiviMate and Kodi catch-up attributes to channel entries', () => {
   const output = addCatchupChannelTags('#EXTM3U\n#EXTINF:-1 tvg-id="one",One\nchannel.m3u8\n', 'https://origin.example/list.m3u', 'http://proxy.test:8787');
   assert.match(output, /catchup="default" catchup-days="1"/);
-  assert.match(output, /catchup-source="http:\/\/proxy\.test:8787\/catchup\?url=https%3A%2F%2Forigin\.example%2Fchannel\.m3u8&start=\{utc\}&duration=\{duration\}"/);
+  assert.match(output, /catchup-source="http:\/\/proxy\.test:8787\/catchup\/aHR0cHM6Ly9vcmlnaW4uZXhhbXBsZS9jaGFubmVsLm0zdTg\/\{utc\}\/\{duration\}\.m3u8"/);
+});
+
+test('supports per-channel catch-up day declarations', () => {
+  const output = addCatchupChannelTags('#EXTM3U\n#EXTINF:-1 tvg-name="ZDF",ZDF\nchannel.m3u8\n', 'https://origin.example/list.m3u', 'http://proxy.test:8787', () => 2);
+  assert.match(output, /catchup-days="2"/);
+});
+
+test('adds Kodi ffmpegdirect inputstream properties per channel', () => {
+  const output = addKodiFfmpegDirect('#EXTM3U\n#EXTINF:-1,One\none.m3u8\n#EXTINF:-1,Two\ntwo.m3u8\n');
+  assert.equal((output.match(/#KODIPROP:inputstream=inputstream\.ffmpegdirect/g) ?? []).length, 2);
 });
 
 test('selects only the requested program range from a dated media playlist', () => {
@@ -52,4 +62,25 @@ test('keeps media chunks on the byte proxy while propagating catch-up to child p
   const output = rewriteUris('child.m3u8\nchunk.aac\n', 'https://origin.example/live/master.m3u8', 'http://proxy.test:8787', { start: '1', duration: '60' });
   assert.match(output, /\/catchup\?url=https%3A%2F%2Forigin\.example%2Flive%2Fchild\.m3u8&start=1&duration=60/);
   assert.match(output, /\/proxy\?url=https%3A%2F%2Forigin\.example%2Flive%2Fchunk\.aac/);
+});
+
+test('generates a ZDF catch-up playlist from numbered historical segments', () => {
+  const source = `#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:100\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:03:20.000Z\n#EXTINF:2.000,\nhttps://zdf.example/100.ts\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:03:22.000Z\n#EXTINF:2.000,\nhttps://zdf.example/101.ts\n`;
+  const output = zdfCatchupPlaylist({ playlist: source, sourceUrl: 'https://zdf.example/index.m3u8', start: 190, duration: 14, earliestSequence: 95 });
+  assert.match(output, /#EXT-X-MEDIA-SEQUENCE:95/);
+  assert.match(output, /https:\/\/zdf\.example\/95\.ts/);
+  assert.match(output, /https:\/\/zdf\.example\/101\.ts/);
+  assert.match(output, /#EXT-X-ENDLIST/);
+});
+
+test('returns unavailable when a ZDF program ends before the archive boundary', () => {
+  const source = `#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:03:20.000Z\n#EXTINF:2,\nhttps://zdf.example/100.ts\n`;
+  assert.equal(zdfCatchupPlaylist({ playlist: source, sourceUrl: 'https://zdf.example/index.m3u8', start: 180, duration: 4, earliestSequence: 95 }), null);
+});
+
+test('generates numbered ZDF AAC catch-up segments for external audio renditions', () => {
+  const source = `#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:03:20.000Z\n#EXTINF:2,\nhttps://zdf.example/100.aac\n`;
+  const output = zdfCatchupPlaylist({ playlist: source, sourceUrl: 'https://zdf.example/audio.m3u8', start: 190, duration: 4, earliestSequence: 95 });
+  assert.match(output, /https:\/\/zdf\.example\/95\.aac/);
+  assert.match(output, /#EXT-X-ENDLIST/);
 });
